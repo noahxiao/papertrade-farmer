@@ -17,8 +17,9 @@ from .config import Config
 from .context import MarketContext
 from .guards import RelayerBreaker
 from .models import AccountSnapshot
-from .tranches import OPPORTUNISTIC, OpportunisticWindow, Tranche, TrancheUsage, choose_tranche
+from .tranches import OPPORTUNISTIC, OpportunisticWindow, Tranche, TrancheUsage, choose_tranche, effective_budget
 from .value_side import payback_days
+from .volatility import CloseShape
 
 
 @dataclass(frozen=True)
@@ -60,12 +61,13 @@ def min_margin_usd(ctx: MarketContext, leverage: int) -> float:
     return math.ceil(max(ctx.trading.min_margin_usd, ctx.trading.min_notional_usd / leverage) * 100) / 100
 
 
-def size_round(cfg: Config, ctx: MarketContext, account: AccountSnapshot, target_margin_usd: float | None = None) -> RoundSizing | None:
+def size_round(cfg: Config, ctx: MarketContext, account: AccountSnapshot, leverage: int,
+               target_margin_usd: float | None = None) -> RoundSizing | None:
     """Margin per leg: the target (default MARGIN_PER_LEG_USD), capped by balance when sizing from balance.
 
-    A target of 0 means the protocol minimum at the configured leverage. None if the result is too small.
+    A target of 0 means the protocol minimum at `leverage`. None if the result is too small.
     """
-    floor = min_margin_usd(ctx, cfg.leverage)
+    floor = min_margin_usd(ctx, leverage)
     margin = cfg.margin_per_leg_usd if target_margin_usd is None else target_margin_usd
     if margin <= 0:
         margin = floor
@@ -74,7 +76,7 @@ def size_round(cfg: Config, ctx: MarketContext, account: AccountSnapshot, target
     margin = int(margin * 100) / 100
     if margin < floor:
         return None
-    return RoundSizing(margin, cfg.leverage)
+    return RoundSizing(margin, leverage)
 
 
 def fit_to_room(sizing: RoundSizing | None, room_usd: float, worst_per_margin_usd: float, floor_usd: float) -> RoundSizing | None:
@@ -187,15 +189,16 @@ def value_side_gates(cfg: Config, ctx: MarketContext, market: str) -> list[GateR
     return out
 
 
-def lp_floor_gate(cfg: Config, ctx: MarketContext) -> GateResult:
-    if cfg.lp_floor_usd is None:
+def lp_floor_gate(cfg: Config, ctx: MarketContext, floor_usd: float | None) -> GateResult:
+    """`floor_usd` is LP_FLOOR_USD, or the lower opportunistic floor for flat-band rounds."""
+    if floor_usd is None:
         return _g("lp_floor", True)
     lp, trend = ctx.value.lp_usd, ctx.value.lp_trend_usd_per_h
-    if lp < cfg.lp_floor_usd:
-        return _g("lp_floor", False, f"tracked LP ${lp / 1e6:.2f}M below ${cfg.lp_floor_usd / 1e6:.2f}M floor")
+    if lp < floor_usd:
+        return _g("lp_floor", False, f"tracked LP ${lp / 1e6:.2f}M below ${floor_usd / 1e6:.2f}M floor")
     if trend is not None and trend < 0:
         projected = lp + trend * cfg.lp_trend_horizon_h
-        if projected < cfg.lp_floor_usd:
+        if projected < floor_usd:
             return _g("lp_floor", False, f"LP trending below floor: ${lp / 1e6:.2f}M, {trend / 1e3:+.0f}k/h, "
                                          f"${projected / 1e6:.2f}M in {cfg.lp_trend_horizon_h:g}h")
     return _g("lp_floor", True)
@@ -212,7 +215,7 @@ def mint_rate_stop_gate(cfg: Config, ctx: MarketContext) -> GateResult:
 
 def close_latency_gate(paused_until: float, now: float) -> GateResult:
     if now < paused_until:
-        return _g("close_latency", False, f"closes repeatedly slow; paused for {(paused_until - now) / 60:.0f} more min")
+        return _g("close_latency", False, f"closes repeatedly slow or overshooting; paused for {(paused_until - now) / 60:.0f} more min")
     return _g("close_latency", True)
 
 
@@ -221,34 +224,37 @@ class RoundPlan:
     sizing: RoundSizing | None
     tranche: Tranche | None
     gates: list[GateResult]
+    shape: CloseShape | None = None
 
 
-def _worst_case(cfg: Config, ctx: MarketContext, market: str, sizing: RoundSizing | None) -> float:
+def _worst_case(cfg: Config, ctx: MarketContext, market: str, sizing: RoundSizing | None, tp_move: float) -> float:
     inst = ctx.trading.instruments.get(market)
     if sizing is None or inst is None:
         return 0.0
     return cfg.round_cost_safety_factor * economics.worst_case_round_loss_usd(
-        sizing.margin_usd, sizing.leverage, cfg.take_profit_move, inst.bust_buffer, economics.ImpactParams.from_instrument(inst))
+        sizing.margin_usd, sizing.leverage, tp_move, inst.bust_buffer, economics.ImpactParams.from_instrument(inst))
 
 
 def plan_round(cfg: Config, ctx: MarketContext, market: str, account: AccountSnapshot, breaker: RelayerBreaker,
                budget: LossBudget, session_address: str | None, tranche_usage: dict[str, TrancheUsage],
                close_latency_paused_until: float = 0.0) -> RoundPlan:
-    """Pick tranche and size for the next round and evaluate every entry gate.
+    """Pick tranche, close shape and size for the next round and evaluate every entry gate.
 
     The round is sized down so that its worst case fits the chosen tranche and
     the daily loss cap, which lets budgets be spent fully without being overrun.
     """
-    sizing = size_round(cfg, ctx, account)
-    floor = min_margin_usd(ctx, cfg.leverage)
-    worst_per_margin = _worst_case(cfg, ctx, market, RoundSizing(1.0, cfg.leverage))
+    shape = ctx.shapes.get(market)
+    tp, leverage = (shape.tp_move, shape.leverage) if shape else (cfg.take_profit_move, cfg.leverage)
+    sizing = size_round(cfg, ctx, account, leverage)
+    floor = min_margin_usd(ctx, leverage)
+    worst_per_margin = _worst_case(cfg, ctx, market, RoundSizing(1.0, leverage), tp)
     tranche = None
+    lp_floor = cfg.lp_floor_usd
     results = [
         market_open_gate(ctx, market),
         payout_queue_gate(ctx),
         relayer_gate(ctx, breaker),
         session_key_gate(cfg, account, session_address, ctx.now),
-        lp_floor_gate(cfg, ctx),
         mint_rate_stop_gate(cfg, ctx),
         close_latency_gate(close_latency_paused_until, ctx.now),
     ]
@@ -256,22 +262,24 @@ def plan_round(cfg: Config, ctx: MarketContext, market: str, account: AccountSna
         decision = choose_tranche(
             cfg.tranches, tranche_usage, ctx.now, ctx.spot_mint_rate, cfg.min_mint_rate, ctx.queue.is_open,
             OpportunisticWindow(cfg.opportunistic_lp_min_usd, ctx.summary.mint.cliff_usd), ctx.value.lp_usd,
-            worst_per_margin * floor,
+            worst_per_margin * floor, cfg.lp_floor_usd,
         )
         tranche = decision.tranche
         if tranche is not None:
             if tranche.kind == OPPORTUNISTIC:
-                sizing = size_round(cfg, ctx, account, cfg.opportunistic_margin_per_leg_usd)
-            room = tranche.budget_usd - tranche_usage.get(tranche.name, TrancheUsage()).used_usd
+                sizing = size_round(cfg, ctx, account, leverage, cfg.opportunistic_margin_per_leg_usd)
+                lp_floor = cfg.opportunistic_lp_min_usd
+            room = effective_budget(tranche, cfg.tranches, tranche_usage) - tranche_usage.get(tranche.name, TrancheUsage()).used_usd
             sizing = fit_to_room(sizing, room, worst_per_margin, floor)
         results.append(_g("tranche", tranche is not None, decision.detail))
+    results.insert(4, lp_floor_gate(cfg, ctx, lp_floor))
     daily_room = budget.cap_usd - budget.used_usd - budget.open_worst_case_usd
     sizing = fit_to_room(sizing, daily_room, worst_per_margin, floor)
     if market in ctx.trading.instruments:
         results += [size_gate(ctx, market, sizing), cost_gate(cfg, ctx, market),
-                    daily_loss_gate(budget, _worst_case(cfg, ctx, market, sizing))]
+                    daily_loss_gate(budget, _worst_case(cfg, ctx, market, sizing, tp))]
         results += value_side_gates(cfg, ctx, market)
-    return RoundPlan(sizing, tranche, results)
+    return RoundPlan(sizing, tranche, results, shape)
 
 
 def worst_case_for(cfg: Config, ctx: MarketContext | None, market: str, margin_usd: float, leverage: int, tp_move: float) -> float:

@@ -13,8 +13,9 @@ from .gates import GateResult
 from .guards import Finding
 from .models import AccountSnapshot
 from .store import Store
-from .tranches import OPPORTUNISTIC, OpportunisticWindow, TrancheUsage
+from .tranches import OPPORTUNISTIC, OpportunisticWindow, TrancheUsage, effective_budget, tranche_room
 from .value_side import YIELD_WINDOW_H, payback_days
+from .volatility import VOL_MATCHED, CloseShape, VolReading, choose_shape
 
 
 def _utc(ts: float) -> str:
@@ -67,20 +68,50 @@ def protocol_section(cfg: Config, ctx: MarketContext, baseline: dict) -> list[st
     return lines
 
 
-def economics_section(cfg: Config, ctx: MarketContext) -> list[str]:
+def shape_lines(market: str, shape: CloseShape) -> list[str]:
+    lines = [f"  {market} {shape.leverage}x, close at {shape.tp_move:.2%} ({shape.mode}): liquidation after "
+             f"{shape.liq_move:.3%} adverse (take-profit = {shape.tp_fraction_of_liq:.0%} of it, gap {shape.gap_to_liq:.3%}); "
+             f"emergency close {shape.emergency_distance:.3%} before bust"]
+    if shape.mode == VOL_MATCHED:
+        lines.append(f"    sigma {_opt(shape.sigma_hourly, '.3%')}/h ({shape.sigma_source}); {shape.note}")
+    return lines
+
+
+def spend_rate_usd_per_h(cfg: Config, ctx: MarketContext, market: str) -> float | None:
+    """Expected farming loss per hour at the current shape: cost of one round / expected round length."""
+    shape, est = ctx.shapes.get(market), ctx.costs.get(market)
+    if shape is None or est is None or est.cycle_hours <= 0:
+        return None
+    return cfg.margin_per_leg_usd * shape.leverage * est.spot.net_cost_per_notional / est.cycle_hours
+
+
+def pace_line(cfg: Config, ctx: MarketContext) -> str | None:
+    if not ctx.pace:
+        return None
+    line = f"  Pace: {ctx.pace.describe()}"
+    rate = sum(r for m in cfg.markets if (r := spend_rate_usd_per_h(cfg, ctx, m)) is not None)
+    nxt = ctx.pace.next
+    if rate and nxt:
+        projected = ctx.pace.spent_usd + rate * max(nxt.at - ctx.now, 0) / 3600
+        line += f"; at ~${rate:,.0f}/h projected ${projected:,.0f} by then"
+    return line
+
+
+def economics_section(cfg: Config, ctx: MarketContext, close_quality: dict | None = None) -> list[str]:
     lines = []
     for market in cfg.markets:
         est = ctx.costs[market]
         inst = ctx.trading.instruments[market]
-        liq = 1 / cfg.leverage - inst.bust_buffer
+        shape = ctx.shapes.get(market) or choose_shape(cfg, market, VolReading(None, "not_used"), inst.bust_buffer,
+                                                       inst.max_leverage)
         pb_flat = payback_days(est.cost_per_paper, ctx.value.fee_yield_per_paper_day, 0.0)
         pb_trend = payback_days(est.cost_per_paper, ctx.value.fee_yield_per_paper_day, ctx.value.yield_trend_per_day)
-        lines += [
-            f"  {market} {cfg.leverage}x, close at {cfg.take_profit_move:.2%}: liquidation after {liq:.3%} adverse "
-            f"(take-profit = {cfg.take_profit_move / liq:.0%} of it)",
+        lines += shape_lines(market, shape) + [
             f"    cost/PAPER spot ${est.spot.cost_per_paper:.5f}; at close ${est.cost_per_paper:.5f} "
             f"(cycle ~{est.cycle_hours:.1f}h, rate {est.spot.mint_rate:.1f} -> {est.at_close.mint_rate:.1f}); "
             f"limit {_opt(cfg.max_cost_per_paper, '.5f', 'off')}",
+            f"    at ${cfg.margin_per_leg_usd:,.0f}/leg: ~${cfg.margin_per_leg_usd * shape.leverage * est.spot.net_cost_per_notional:,.0f} "
+            f"expected loss per round, ~${_opt(spend_rate_usd_per_h(cfg, ctx, market), ',.0f')}/h",
             f"    payback per PAPER: {_opt(pb_flat, '.1f', 'never')} days at current yield, "
             f"{_opt(pb_trend, '.1f', 'never')} days with yield trend (365d horizon)",
             f"    mid {ctx.mids.get(market, float('nan')):,.2f}; OI long {inst.long_oi:,.0f}/{inst.long_cap:,.0f}, "
@@ -89,6 +120,12 @@ def economics_section(cfg: Config, ctx: MarketContext) -> list[str]:
     window = OpportunisticWindow(cfg.opportunistic_lp_min_usd, ctx.summary.mint.cliff_usd)
     lines.append(f"  Opportunistic trigger (LP {_m(window.lp_min_usd)}-{_m(window.lp_max_usd)}, queue empty): "
                  f"{'ACTIVE' if window.active(ctx.summary.tracked_lp_usd, ctx.queue.is_open) else 'inactive'}")
+    if pace_line(cfg, ctx):
+        lines.append(pace_line(cfg, ctx))
+    q = close_quality or {}
+    if q.get("derate_steps") or q.get("slow_streak"):
+        lines.append(f"  Close quality: leverage derate {q.get('derate_steps', 0)}/{cfg.leverage_derate_max_steps} step(s); "
+                     f"{q.get('slow_streak', 0)} slow/overshooting close(s) in a row")
     return lines
 
 
@@ -116,8 +153,10 @@ def tranche_section(cfg: Config, usage: dict[str, TrancheUsage], now: float) -> 
             window.append(f"until {_utc(t.available_until)}")
         state = "open" if t.in_window(now) else "closed"
         rate = t.min_mint_rate if t.min_mint_rate is not None else cfg.min_mint_rate
-        lines.append(f"  {t.name} ({t.kind}{', LP-band trigger' if t.kind == OPPORTUNISTIC else ''}): "
-                     f"${u.used_usd:,.2f} of ${t.budget_usd:,.2f} used, ${max(t.budget_usd - u.used_usd, 0):,.2f} left; "
+        budget = effective_budget(t, cfg.tranches, usage)
+        lines.append(f"  {t.name} ({t.kind}{', LP-band trigger' if t.kind == OPPORTUNISTIC else ''}"
+                     f"{', unspent remainder of the plan' if t.remainder else ''}): "
+                     f"${u.used_usd:,.2f} of ${budget:,.2f} used, ${tranche_room(t, cfg.tranches, usage):,.2f} left; "
                      f"min mint rate {rate:g}; window {state} {' '.join(window)}".rstrip())
     return lines
 
@@ -133,10 +172,10 @@ def gates_section(gates: list[GateResult], findings: list[Finding]) -> list[str]
 
 def monitor_report(cfg: Config, ctx: MarketContext, baseline: dict, account: AccountSnapshot | None,
                    gates: list[GateResult], findings: list[Finding], usage: dict[str, TrancheUsage],
-                   budget_line: str) -> str:
+                   budget_line: str, close_quality: dict | None = None) -> str:
     out = [f"Papertrade monitor  {_utc(ctx.now)}  block {ctx.summary.block:,}  mode {cfg.mode} (read-only)", "Protocol"]
     out += protocol_section(cfg, ctx, baseline)
-    out += ["Economics"] + economics_section(cfg, ctx)
+    out += ["Economics"] + economics_section(cfg, ctx, close_quality)
     out += ["Account"] + account_section(account, ctx)
     out += ["Budget", f"  {budget_line}"] + tranche_section(cfg, usage, ctx.now)
     out += ["Next-round gates"] + gates_section(gates, findings)
@@ -155,6 +194,14 @@ def monitor_json(cfg: Config, ctx: MarketContext, account: AccountSnapshot | Non
                            for m, c in ctx.costs.items()},
         "payback_days": {m: payback_days(c.cost_per_paper, v.fee_yield_per_paper_day, v.yield_trend_per_day)
                          for m, c in ctx.costs.items()},
+        "close_shape": {m: {"mode": s.mode, "tp_move": s.tp_move, "leverage": s.leverage, "liq_move": s.liq_move,
+                            "tp_fraction_of_liq": s.tp_fraction_of_liq, "emergency_distance": s.emergency_distance,
+                            "sigma_hourly": s.sigma_hourly, "sigma_source": s.sigma_source, "behind_pace": s.behind_pace,
+                            "derate_steps": s.derate_steps, "note": s.note,
+                            "spend_usd_per_h": spend_rate_usd_per_h(cfg, ctx, m)}
+                        for m, s in ctx.shapes.items() if m in cfg.markets},
+        "pace": None if ctx.pace is None else {"spent_usd": ctx.pace.spent_usd, "behind": ctx.pace.behind,
+                                               "describe": ctx.pace.describe()},
         "account": None if account is None else {
             "available_usd": account.available_balance_usd, "paper_unstaked": account.paper_balance,
             "paper_staked": account.paper_staked,
@@ -233,6 +280,11 @@ def daily_summary_text(cfg: Config, s: DaySummary, usage: dict[str, TrancheUsage
         lp_vs = ", ".join(f"{'+' if d >= 0 else '-'}{_m(abs(d))} vs {_m(line)}" for _, line, d in lp_lines(ctx, baseline))
         btc = ctx.costs.get("BTC")
         pb = payback_days(btc.cost_per_paper, v.fee_yield_per_paper_day, v.yield_trend_per_day) if btc else None
+        for market in cfg.markets:
+            if market in ctx.shapes:
+                lines += [line.strip() for line in shape_lines(f"Next round {market}:", ctx.shapes[market])]
+        if ctx.pace:
+            lines.append(pace_line(cfg, ctx).strip())
         lines += [
             f"Protocol now: mint rate {ctx.spot_mint_rate:.1f}/$; LP {_m(v.lp_usd)} ({lp_vs}); "
             f"queue {'OPEN $' + format(v.queue_usd, ',.0f') if v.queue_open else 'empty'}",

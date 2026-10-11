@@ -28,11 +28,12 @@ from .guards import RelayerBreaker, check_contracts, check_frontend, check_proto
 from .models import AccountSnapshot, ClosedTrade, FeedFormatError
 from .protocol import INSTRUMENTS, MAX_CLOSE_IDS
 from .relayer import SubmitResult, SubmitStatus
-from .rounds import CloseRecord, Leg, LegStatus, Round, RoundState
+from .rounds import CloseRecord, Leg, LegStatus, Round, RoundState, close_overshoot
 from .staking import NoStaking, StakingModule
 from .store import Store
 from .tranches import TrancheUsage
 from .venue import PreparedIntent, Venue
+from .volatility import CLOSE_QUALITY_KEY, VOL_MATCHED, CloseShape
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ MINT_CHECK_TOLERANCE = 0.10
 STAKE_MIN_INTERVAL_S = 300
 SWEEP_KEY = "sweep"
 HALT_KEY = "halt"
+PACE_KEY = "pace"
 
 GATE_ALERTS = {
     "cost_per_paper": ("cost_gate", "warning"),
@@ -56,7 +58,8 @@ GATE_ALERTS = {
     "close_latency": ("close_latency", "warning"),
     "tranche": ("tranche_unavailable", "info"),
 }
-LATENCY_KEY = "close_latency"
+CLOSE_QUALITY_DEFAULT = {"slow_streak": 0, "good_streak": 0, "derate_steps": 0, "paused_until": 0.0}
+DERATE_RECOVERY_CLOSES = 5
 
 FEED_ERRORS = (FeedError, FeedFormatError)
 
@@ -148,6 +151,8 @@ class Farmer:
         still_active = [r for r in rounds if r.active]
         if not still_active:
             self._maybe_stake(account, ctx, now)
+        if ctx is not None and len(still_active) < len(rounds):
+            ctx = self.last_ctx = self.view.reshape(ctx)  # settled rounds move pace and close quality
         if ctx is not None and not self.shutting_down:
             self._maybe_start_rounds(ctx, account, now, still_active)
         self.last_tick_ok = True
@@ -345,9 +350,10 @@ class Farmer:
         move = (mid - r.entry_ref) / r.entry_ref
         loser = r.short if move > 0 else r.long
         bust_distance = abs(loser.bust_price - mid) / mid if loser.bust_price else 1.0
+        emergency = r.emergency_distance if r.emergency_distance is not None else self.cfg.emergency_bust_distance
         if abs(move) >= r.tp_move:
             self._to_closing(r, "take_profit")
-        elif bust_distance <= self.cfg.emergency_bust_distance:
+        elif bust_distance <= emergency:
             self._to_closing(r, "emergency_bust_distance")
 
     def _step_closing(self, r: Round, account: AccountSnapshot, ctx: MarketContext | None, now: float) -> None:
@@ -433,7 +439,7 @@ class Farmer:
         r.paper_minted = sum(leg.paper_minted for leg in r.legs)
         r.cost_per_paper = -r.net_pnl_usd / r.paper_minted if r.paper_minted > 0 else None
         r.state = RoundState.DONE.value if r.became_hedged else RoundState.ABORTED.value
-        self._record_close_latency(r)
+        self._record_close_quality(r)
         self._mint_cross_check(r)
         self._save(r, closed=True)
         self._event("round_closed", r, outcome=r.state, reason=r.close_reason, liquidated=r.liquidated,
@@ -441,7 +447,8 @@ class Farmer:
                     short_entry=r.short.entry_price, short_exit=r.short.exit_price, short_pnl=r.short.net_pnl_usd,
                     net_pnl=r.net_pnl_usd, paper_minted=r.paper_minted, cost_per_paper=r.cost_per_paper,
                     expected_cost_per_paper=r.expected_cost_per_paper, tranche=r.tranche,
-                    close_latency_s=r.close_latency_s, notes=r.notes)
+                    close_latency_s=r.close_latency_s, close_mode=r.close_mode, tp_move=r.tp_move, leverage=r.leverage,
+                    exit_move=r.exit_move, overshoot_fraction=r.overshoot_fraction, notes=r.notes)
         if self.last_account is not None:
             self._maybe_stake(self.last_account, self.last_ctx, now, force=True)
 
@@ -510,21 +517,44 @@ class Farmer:
     def tranche_usage(self, active: list[Round]) -> dict[str, TrancheUsage]:
         return budget.tranche_usage(self.cfg, self.store, self.last_ctx, active)
 
-    def _record_close_latency(self, r: Round) -> None:
+    def _record_close_quality(self, r: Round) -> None:
+        """Track slow or overshooting closes: in vol_matched mode lower leverage first, then pause new rounds."""
         if r.close_started_at is None or r.positions_gone_at is None or not r.closes:
             return
+        cfg = self.cfg
         r.close_latency_s = r.positions_gone_at - r.close_started_at
-        state = self.store.kv_get(LATENCY_KEY, {"slow_streak": 0, "paused_until": 0.0})
-        if r.close_latency_s > self.cfg.close_latency_alert_s:
-            state["slow_streak"] += 1
-            if state["slow_streak"] >= self.cfg.close_latency_alert_count:
-                state["paused_until"] = self.clock() + self.cfg.close_latency_pause_s
-                self.notifier.alert("slow_closes", f"{state['slow_streak']} consecutive closes took longer than "
-                                    f"{self.cfg.close_latency_alert_s / 60:.0f} min (last {r.close_latency_s / 60:.1f} min); "
-                                    f"new rounds paused {self.cfg.close_latency_pause_s / 60:.0f} min", level="error", cooldown_s=0)
-        else:
+        r.exit_move, r.overshoot_fraction = close_overshoot(r)
+        slow = r.close_latency_s > cfg.close_latency_alert_s
+        overshot = r.overshoot_fraction is not None and r.overshoot_fraction > cfg.close_overshoot_alert_fraction
+        state = {**CLOSE_QUALITY_DEFAULT, **self.store.kv_get(CLOSE_QUALITY_KEY, {})}
+        if not (slow or overshot):
             state["slow_streak"] = 0
-        self.store.kv_set(LATENCY_KEY, state)
+            state["good_streak"] += 1
+            if state["derate_steps"] and state["good_streak"] >= DERATE_RECOVERY_CLOSES:
+                state["derate_steps"] -= 1
+                state["good_streak"] = 0
+                self.notifier.alert("leverage_restored", f"{DERATE_RECOVERY_CLOSES} clean closes; leverage derate now "
+                                    f"{state['derate_steps']} step(s)", level="info", cooldown_s=0)
+            self.store.kv_set(CLOSE_QUALITY_KEY, state)
+            return
+
+        state["good_streak"] = 0
+        state["slow_streak"] += 1
+        what = (f"last close took {r.close_latency_s / 60:.1f} min"
+                + (f", overshot by {r.overshoot_fraction:.0%} of the take-profit-to-liquidation gap" if overshot else ""))
+        if state["slow_streak"] >= cfg.close_latency_alert_count:
+            if cfg.close_mode == VOL_MATCHED and state["derate_steps"] < cfg.leverage_derate_max_steps:
+                state["derate_steps"] += 1
+                state["slow_streak"] = 0
+                self.notifier.alert("leverage_derated", f"{cfg.close_latency_alert_count} consecutive slow/overshooting closes "
+                                    f"({what}); lowering leverage (derate step {state['derate_steps']}/"
+                                    f"{cfg.leverage_derate_max_steps})", level="warning", cooldown_s=0)
+            else:
+                state["paused_until"] = self.clock() + cfg.close_latency_pause_s
+                self.notifier.alert("slow_closes", f"{state['slow_streak']} consecutive closes slower than "
+                                    f"{cfg.close_latency_alert_s / 60:.0f} min or overshooting ({what}); "
+                                    f"new rounds paused {cfg.close_latency_pause_s / 60:.0f} min", level="error", cooldown_s=0)
+        self.store.kv_set(CLOSE_QUALITY_KEY, state)
 
     def _report_gates(self, market: str, blocked_now: list) -> None:
         names = {g.name for g in blocked_now}
@@ -547,34 +577,59 @@ class Farmer:
             last = self.store.last_closed_at(market)
             if last is not None and now - last < self.cfg.round_cooldown_s:
                 continue
-            paused_until = self.store.kv_get(LATENCY_KEY, {}).get("paused_until", 0.0)
+            self._report_shape(market, ctx)
+            paused_until = self.store.kv_get(CLOSE_QUALITY_KEY, {}).get("paused_until", 0.0)
             plan = plan_round(self.cfg, ctx, market, account, self.breaker, self.loss_budget(now, active),
                               self.session_address, self.tranche_usage(active), paused_until)
             blocked_now = blocking(plan.gates, self.cfg.dry_run_force_rounds)
             self._report_gates(market, blocked_now)
             if blocked_now:
                 continue
-            active.append(self._start_round(market, ctx, plan.sizing, now, plan.tranche.name if plan.tranche else None))
+            active.append(self._start_round(market, ctx, plan.sizing, now, plan.tranche.name if plan.tranche else None,
+                                            plan.shape))
 
-    def _start_round(self, market: str, ctx: MarketContext, sizing, now: float, tranche: str | None = None) -> Round:
+    def _report_shape(self, market: str, ctx: MarketContext) -> None:
+        shape = ctx.shapes.get(market)
+        if shape is None or shape.mode != VOL_MATCHED:
+            return
+        if shape.sigma_source == "unavailable":
+            self.notifier.alert("volatility_unavailable", f"{market}: no recent Hyperliquid candles; using the widest close "
+                                f"{shape.tp_move:.2%} at {shape.leverage}x", level="warning", dedupe_key=f"vol:{market}", cooldown_s=3600)
+        behind = bool(ctx.pace and ctx.pace.behind)
+        was_behind = self.store.kv_get(PACE_KEY, {}).get("behind", False)
+        if behind != was_behind:
+            self.store.kv_set(PACE_KEY, {"behind": behind, "ts": ctx.now})
+            if behind:
+                self.notifier.alert("behind_pace", f"{ctx.pace.describe()}; tightening close to {shape.tp_move:.2%} at "
+                                    f"{shape.leverage}x", level="warning", cooldown_s=0)
+            else:
+                self.notifier.alert("pace_restored", f"{ctx.pace.describe() if ctx.pace else 'no pace schedule'}", level="info", cooldown_s=0)
+
+    def _start_round(self, market: str, ctx: MarketContext, sizing, now: float, tranche: str | None = None,
+                     shape: CloseShape | None = None) -> Round:
         instrument_id = INSTRUMENTS[market]
         margin_wad = int(round(sizing.margin_usd * 100)) * 10**16
         est = ctx.costs[market]
+        tp_move = shape.tp_move if shape else self.cfg.take_profit_move
         round_id = self.store.insert_round(market, RoundState.OPENING.value, {})
         p_long = self.venue.prepare_open(instrument_id, True, margin_wad, sizing.leverage)
         p_short = self.venue.prepare_open(instrument_id, False, margin_wad, sizing.leverage)
         r = Round(
             id=round_id, market=market, instrument_id=instrument_id, state=RoundState.OPENING.value, created_at=now,
-            margin_usd=sizing.margin_usd, leverage=sizing.leverage, tp_move=self.cfg.take_profit_move,
+            margin_usd=sizing.margin_usd, leverage=sizing.leverage, tp_move=tp_move,
             long=Leg("long", p_long.intent_id, p_long.deadline), short=Leg("short", p_short.intent_id, p_short.deadline),
             tranche=tranche, expected_cost_per_paper=est.cost_per_paper, mint_rate_at_open=est.spot.mint_rate,
             submitted_at=now,
         )
+        if shape is not None:
+            r.close_mode, r.emergency_distance, r.liq_move = shape.mode, shape.emergency_distance, shape.liq_move
+            r.sigma_hourly, r.behind_pace = shape.sigma_hourly, shape.behind_pace
         for p, purpose in ((p_long, "open_long"), (p_short, "open_short")):
             self.store.record_intent(p.intent_id, round_id, purpose, p.action, p.nonce, p.deadline, p.signed)
         self._save(r)
         self._event("round_opened", r, tranche=tranche, margin=sizing.margin_usd, leverage=sizing.leverage, notional=sizing.notional_usd,
-                    tp_move=self.cfg.take_profit_move, expected_cost_per_paper=est.cost_per_paper, mint_rate=est.spot.mint_rate)
+                    tp_move=tp_move, close_mode=r.close_mode, liq_move=r.liq_move, sigma_hourly=r.sigma_hourly,
+                    behind_pace=r.behind_pace, expected_cost_per_paper=est.cost_per_paper, mint_rate=est.spot.mint_rate)
 
         first = self._submit(p_long, round_id, "open_long", record=False)
         self._apply_submit(r.long, first)

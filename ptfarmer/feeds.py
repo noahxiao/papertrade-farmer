@@ -132,6 +132,18 @@ class PublicFeeds:
             raise FeedError("hyperliquid allMids: no BTC/ETH mids")
         return out
 
+    def hl_candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
+        req = {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms}
+        try:
+            resp = self.http.post(self.hl_info_url, json={"type": "candleSnapshot", "req": req}, timeout=self.timeout_s)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise FeedError(f"hyperliquid candles {coin}: {exc}") from exc
+        if not isinstance(data, list) or any(not isinstance(c, dict) or not {"t", "T", "c"} <= set(c) for c in data):
+            raise FeedFormatError(f"hyperliquid candles {coin}: unexpected shape")
+        return data
+
     def rpc(self, method: str, params: list) -> str:
         try:
             resp = self.http.post(

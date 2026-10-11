@@ -11,13 +11,14 @@ from datetime import datetime, timezone
 
 from . import budget
 from .app import build_farmer, build_readonly
-from .config import ConfigError, load_config
+from .config import DEFAULT_BUST_BUFFER, ConfigError, load_config
 from .feeds import FeedError
 from .gates import plan_round
 from .guards import RelayerBreaker, check_contracts, check_frontend, check_protocol_params
 from .models import AccountSnapshot, FeedFormatError
 from .reporting import daily_summary_text, monitor_json, monitor_report, summarize_day
 from .service import Service, heartbeat_age_s
+from .volatility import CLOSE_QUALITY_KEY, VOL_MATCHED, VolReading, choose_shape
 
 log = logging.getLogger("ptfarmer")
 
@@ -62,7 +63,8 @@ def cmd_monitor(args) -> int:
         else:
             budget_line = (f"daily loss budget: ${loss.used_usd:,.2f} used of ${loss.cap_usd:,.2f}, "
                            f"${loss.remaining_usd:,.2f} remaining")
-            print(monitor_report(cfg, ctx, c.baseline, account, gates, findings, usage, budget_line))
+            print(monitor_report(cfg, ctx, c.baseline, account, gates, findings, usage, budget_line,
+                                 c.store.kv_get(CLOSE_QUALITY_KEY)))
         if not args.watch:
             return 0
         print("-" * 80, flush=True)
@@ -117,7 +119,8 @@ def cmd_status(args) -> int:
     cfg = load_config()
     c = build_readonly(cfg)
     print(json.dumps({"halt": c.store.kv_get("halt"), "active_rounds": [r.to_dict() for r in budget.active_rounds(c.store)],
-                      "sweep": c.store.kv_get("sweep"), "close_latency": c.store.kv_get("close_latency")}, indent=2, default=str))
+                      "sweep": c.store.kv_get("sweep"), "close_quality": c.store.kv_get(CLOSE_QUALITY_KEY),
+                      "pace": c.store.kv_get("pace")}, indent=2, default=str))
     return 0
 
 
@@ -137,8 +140,16 @@ def cmd_resume(args) -> int:
 def cmd_check_config(args) -> int:
     cfg = load_config()
     print(json.dumps(cfg.redacted(), indent=2, default=str))
-    print(f"\nmode: {cfg.mode}; liquidation at {cfg.liquidation_move:.3%}; take-profit {cfg.take_profit_move:.3%} "
-          f"({cfg.take_profit_move / cfg.liquidation_move:.0%} of liquidation distance)")
+    if cfg.close_mode == VOL_MATCHED:
+        print(f"\nmode: {cfg.mode}; close mode vol_matched: d = {cfg.vol_multiplier:g} x sigma_h over {cfg.vol_window_h:g}h, "
+              f"clamped to {cfg.close_min:.2%}-{cfg.close_max:.2%}; MAX_LEVERAGE {cfg.max_leverage}")
+        for d in sorted({cfg.close_min, (cfg.close_min + cfg.close_max) / 2, cfg.close_max}):
+            s = choose_shape(cfg, "BTC", VolReading(d / cfg.vol_multiplier, "example"), DEFAULT_BUST_BUFFER, cfg.max_leverage)
+            print(f"  d {s.tp_move:.3%}: {s.leverage}x, liquidation {s.liq_move:.3%} (take-profit {s.tp_fraction_of_liq:.0%} of it), "
+                  f"emergency close {s.emergency_distance:.3%} before bust")
+    else:
+        print(f"\nmode: {cfg.mode}; liquidation at {cfg.liquidation_move:.3%}; take-profit {cfg.take_profit_move:.3%} "
+              f"({cfg.take_profit_move / cfg.liquidation_move:.0%} of liquidation distance)")
     return 0
 
 

@@ -14,10 +14,17 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .pace import Checkpoint, PaceError, parse_schedule, parse_utc
 from .tranches import Tranche, TrancheError, load_tranches
 
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_TRADES_REAL_FUNDS"
-MAX_LEVERAGE_CAP = 100
+DEFAULT_MAX_LEVERAGE = 100
+# MAX_LEVERAGE may be raised explicitly up to this ceiling; take-profit must still fit inside liquidation.
+ABSOLUTE_MAX_LEVERAGE = 200
+CLOSE_MODES = ("fixed", "vol_matched")
+CANDLE_INTERVALS = ("5m", "15m", "1h")
+# Minimum distance between the take-profit and the liquidation price in vol_matched mode.
+MIN_TP_LIQ_GAP = 0.002
 SUPPORTED_MARKETS = ("BTC", "ETH")
 STAKE_MODES = ("off", "remind", "auto")
 UNKNOWN_POSITION_POLICIES = ("close", "halt")
@@ -171,6 +178,20 @@ class Config:
     rpc_url: str
     build_id: str
 
+    max_leverage: int = DEFAULT_MAX_LEVERAGE
+    close_mode: str = "fixed"
+    vol_window_h: float = 6.0
+    vol_candle_interval: str = "15m"
+    vol_multiplier: float = 2.0
+    close_min: float = 0.003
+    close_max: float = 0.0075
+    vol_leverage_buffer: float = 0.003
+    leverage_derate_step: float = 0.001
+    leverage_derate_max_steps: int = 2
+    close_overshoot_alert_fraction: float = 0.5
+    pace_schedule: tuple[Checkpoint, ...] = ()
+    pace_start: float = 0.0
+
     @property
     def mode(self) -> str:
         return "LIVE" if self.live else "DRY_RUN"
@@ -219,27 +240,58 @@ def load_config(env: dict[str, str] | None = None, dotenv_path: str | os.PathLik
     if _bool(env, "ENABLE_ETH", False):
         markets.append("ETH")
 
-    leverage = _int(env, "LEVERAGE", 40)
-    if not 1 <= leverage <= MAX_LEVERAGE_CAP:
-        raise ConfigError(f"LEVERAGE must be between 1 and {MAX_LEVERAGE_CAP}, got {leverage}")
+    max_leverage = _int(env, "MAX_LEVERAGE", DEFAULT_MAX_LEVERAGE)
+    if not 1 <= max_leverage <= ABSOLUTE_MAX_LEVERAGE:
+        raise ConfigError(f"MAX_LEVERAGE must be between 1 and {ABSOLUTE_MAX_LEVERAGE}, got {max_leverage}")
+    close_mode = _str(env, "CLOSE_MODE", "fixed").lower()
+    if close_mode not in CLOSE_MODES:
+        raise ConfigError(f"CLOSE_MODE must be one of {CLOSE_MODES}")
 
+    leverage = _int(env, "LEVERAGE", 40)
     tp = _float(env, "TAKE_PROFIT_MOVE_PCT", 1.0) / 100.0
     tp_fraction = _float(env, "TP_MAX_FRACTION_OF_LIQ", 0.60)
     if not 0 < tp_fraction <= 0.8:
         raise ConfigError("TP_MAX_FRACTION_OF_LIQ must be in (0, 0.8]")
-    liq = liquidation_move(leverage)
-    if tp <= 0:
-        raise ConfigError("TAKE_PROFIT_MOVE_PCT must be positive")
-    if tp > tp_fraction * liq:
-        raise ConfigError(
-            f"TAKE_PROFIT_MOVE_PCT={tp * 100:.3f}% is {tp / liq:.0%} of the {liq * 100:.3f}% liquidation "
-            f"distance at {leverage}x; the limit is {tp_fraction:.0%} "
-            f"(max {tp_fraction * liq * 100:.3f}%). Lower the take-profit or the leverage."
-        )
-
     emergency = _float(env, "EMERGENCY_BUST_DISTANCE_PCT", 0.30) / 100.0
-    if emergency >= liq - tp:
-        raise ConfigError("EMERGENCY_BUST_DISTANCE_PCT must be smaller than the gap between take-profit and liquidation")
+    if close_mode == "fixed":
+        if not 1 <= leverage <= max_leverage:
+            raise ConfigError(f"LEVERAGE must be between 1 and MAX_LEVERAGE={max_leverage}, got {leverage}")
+        liq = liquidation_move(leverage)
+        if tp <= 0:
+            raise ConfigError("TAKE_PROFIT_MOVE_PCT must be positive")
+        if tp > tp_fraction * liq:
+            raise ConfigError(
+                f"TAKE_PROFIT_MOVE_PCT={tp * 100:.3f}% is {tp / liq:.0%} of the {liq * 100:.3f}% liquidation "
+                f"distance at {leverage}x; the limit is {tp_fraction:.0%} "
+                f"(max {tp_fraction * liq * 100:.3f}%). Lower the take-profit or the leverage."
+            )
+        if emergency >= liq - tp:
+            raise ConfigError("EMERGENCY_BUST_DISTANCE_PCT must be smaller than the gap between take-profit and liquidation")
+
+    vol_window_h = _float(env, "VOL_WINDOW_H", 6.0)
+    vol_interval = _str(env, "VOL_CANDLE_INTERVAL", "15m")
+    vol_multiplier = _float(env, "VOL_MULTIPLIER", 2.0)
+    close_min = _float(env, "CLOSE_MIN_PCT", 0.30) / 100.0
+    close_max = _float(env, "CLOSE_MAX_PCT", 0.75) / 100.0
+    vol_buffer = _float(env, "VOL_LEVERAGE_BUFFER_PCT", 0.30) / 100.0
+    derate_step = _float(env, "LEVERAGE_DERATE_STEP_PCT", 0.10) / 100.0
+    derate_max = _int(env, "LEVERAGE_DERATE_MAX_STEPS", 2)
+    if vol_interval not in CANDLE_INTERVALS:
+        raise ConfigError(f"VOL_CANDLE_INTERVAL must be one of {CANDLE_INTERVALS}")
+    if vol_window_h < 1 or vol_multiplier <= 0:
+        raise ConfigError("VOL_WINDOW_H must be >= 1 and VOL_MULTIPLIER positive")
+    if not 0.001 <= close_min <= close_max <= 0.02:
+        raise ConfigError("need 0.1 <= CLOSE_MIN_PCT <= CLOSE_MAX_PCT <= 2")
+    if vol_buffer - DEFAULT_BUST_BUFFER < MIN_TP_LIQ_GAP:
+        raise ConfigError(f"VOL_LEVERAGE_BUFFER_PCT must leave at least {MIN_TP_LIQ_GAP:.2%} between take-profit "
+                          f"and liquidation after the {DEFAULT_BUST_BUFFER:.3%} bust buffer")
+    if derate_step < 0 or derate_max < 0:
+        raise ConfigError("LEVERAGE_DERATE_STEP_PCT and LEVERAGE_DERATE_MAX_STEPS must not be negative")
+    try:
+        pace_schedule = parse_schedule(_str(env, "PACE_SCHEDULE"))
+        pace_start = parse_utc(_str(env, "PACE_START"), "PACE_START") if _str(env, "PACE_START") else 0.0
+    except PaceError as exc:
+        raise ConfigError(str(exc)) from exc
 
     margin = _float(env, "MARGIN_PER_LEG_USD", 250.0)
     if margin < 10:
@@ -348,4 +400,17 @@ def load_config(env: dict[str, str] | None = None, dotenv_path: str | os.PathLik
         exchange_origin=_str(env, "EXCHANGE_ORIGIN", "https://exchange.papertrade.xyz").rstrip("/"),
         rpc_url=_str(env, "RPC_URL", "https://rpc.hyperliquid.xyz/evm"),
         build_id=_str(env, "PAPERTRADE_BUILD_ID"),
+        max_leverage=max_leverage,
+        close_mode=close_mode,
+        vol_window_h=vol_window_h,
+        vol_candle_interval=vol_interval,
+        vol_multiplier=vol_multiplier,
+        close_min=close_min,
+        close_max=close_max,
+        vol_leverage_buffer=vol_buffer,
+        leverage_derate_step=derate_step,
+        leverage_derate_max_steps=derate_max,
+        close_overshoot_alert_fraction=_float(env, "CLOSE_OVERSHOOT_ALERT_FRACTION", 0.5),
+        pace_schedule=pace_schedule,
+        pace_start=pace_start,
     )

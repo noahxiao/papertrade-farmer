@@ -9,6 +9,7 @@ outages) can be scripted deterministically.
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 
 from ptfarmer import economics
@@ -77,6 +78,9 @@ class FakeFeeds:
     relayer_ok: bool = True
     mids: dict = field(default_factory=lambda: {"BTC": BTC_MID, "ETH": 3_000.0})
     down: bool = False
+    sigma_hourly: float = 0.0009  # realised BTC vol served by hl_candles (weekend ~0.09%/h)
+    candles_down: bool = False
+    candle_calls: int = 0
 
     def _check(self) -> None:
         if self.down:
@@ -104,6 +108,19 @@ class FakeFeeds:
 
     def history(self):
         return None
+
+    def hl_candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
+        """Candles whose log returns alternate +/-r, so the realised hourly vol is exactly `sigma_hourly`."""
+        self.candle_calls += 1
+        if self.candles_down:
+            raise FeedError("candles down (test)")
+        step_ms = {"5m": 300, "15m": 900, "1h": 3600}[interval] * 1000
+        r = self.sigma_hourly * math.sqrt(step_ms / 3_600_000)
+        out, price = [], BTC_MID
+        for i, t in enumerate(range(start_ms - start_ms % step_ms, end_ms, step_ms)):
+            price *= math.exp(r if i % 2 else -r)
+            out.append({"t": t, "T": t + step_ms - 1, "o": price, "c": price, "h": price, "l": price, "v": 1, "n": 1})
+        return out
 
     def set_queue(self, total_usd: float, count: int) -> None:
         self.queue_obj = QueueSummary(total_usd, count)

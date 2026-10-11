@@ -91,6 +91,13 @@ class Round:
     liquidated: bool = False
     paper_staked_after: float = 0.0
     notes: list[str] = field(default_factory=list)
+    close_mode: str = "fixed"
+    emergency_distance: float | None = None  # early-close distance from bust; None = config value
+    liq_move: float | None = None
+    sigma_hourly: float | None = None
+    behind_pace: bool = False
+    exit_move: float | None = None  # largest |exit fill - entry_ref| / entry_ref over the legs
+    overshoot_fraction: float | None = None  # (exit_move - tp) / (liq - tp)
 
     @property
     def legs(self) -> tuple[Leg, Leg]:
@@ -113,3 +120,23 @@ class Round:
         data["short"] = Leg(**data["short"])
         data["closes"] = [CloseRecord(**c) for c in data.get("closes", [])]
         return cls(**data)
+
+
+def close_overshoot(r: Round) -> tuple[float | None, float | None]:
+    """(exit move, overshoot fraction) of a hedged round's close.
+
+    The fraction is how far past the take-profit the exit fills landed, as a
+    share of the take-profit-to-liquidation gap; a liquidated loser counts as
+    at least 1.0 (the whole gap was crossed before the close landed).
+    """
+    if not r.became_hedged or not r.entry_ref:
+        return None, None
+    moves = [abs(leg.exit_price - r.entry_ref) / r.entry_ref for leg in r.legs
+             if leg.exit_price is not None and leg.status != LegStatus.LIQUIDATED.value]
+    exit_move = max(moves) if moves else None
+    if r.liq_move is None or r.liq_move <= r.tp_move:
+        return exit_move, None
+    fraction = max(0.0, ((exit_move or r.tp_move) - r.tp_move) / (r.liq_move - r.tp_move))
+    if r.liquidated:
+        fraction = max(fraction, 1.0)
+    return exit_move, fraction
