@@ -1,0 +1,34 @@
+{
+  "_comment": "Pinned public protocol fingerprint captured 2026-10-10T23:45Z from /state/trading, /query/protocol/summary, HyperEVM RPC and the exchange frontend (build 7976669c6bab). Any drift halts trading until an operator reviews it and updates this file.",
+  "contracts": {
+    "exchange": "0x6cd5661646289fb6e65ea5c032310fded797d0a2",
+    "paper": "0xe40f17915daa230324030003a197cdaef2261c0e",
+    "paperStaking": "0xaad6c7b0cc3014fc80ffedae0ed7ce5967b0f016",
+    "depositProxyFactory": "0x1629b7d46bef6e13ff754174fc9f32dea309b38f"
+  },
+  "proxy_admin": "0xe79c91cc682f1bb401a9cab74c900470190f0f8f",
+  "proxy_code_hash": "0x93076ef48e1d48172af505f739606cf1fa8425dbf9dbc6bee6743307bd4bd63b",
+  "implementations": {
+    "exchange": {"address": "0x0f3febfc94876b0c895f7acecdc8f5c863b549ee", "code_hash": "0x9d20287df886415035d53344a0dc8a1044949308cc3283ee0fe7ea5f3ea28d92"},
+    "paper": {"address": "0x433bd418ec92818a960585f4d5fae563e735bb4a", "code_hash": "0x087aaaf8472c1ca9bb313493a83fca6f5497d639ef46e6ca2ed0ef4cab85a590"},
+    "paperStaking": {"address": "0xe6e3519455170913c5c3bfe541dd918a2d0cbb15", "code_hash": "0x54573c497e5109e353cf5330343323915e0c0f26e1b410fd3cb2cd8d1460f154"},
+    "depositProxyFactory": {"address": "0x8f22a73a23a2de0dbfdf6729f4d8c07dbdc69cf0", "code_hash": "0xb8ab2884da3e386fc6a5e27971a39247ea6285f35160e85b304be742c0f28812"}
+  },
+  "mint": {"flat_rate": 100.0, "decay_scale_usd": 120000000.0, "cliff_usd": 2000000.0},
+  "staker_cap_schedule": [
+    {"from": "2026-10-01T00:00:00Z", "cap_usd": 5000000.0},
+    {"from": "2026-10-17T18:45:00Z", "cap_usd": 10000000.0}
+  ],
+  "staker_cap_switch_grace_h": 12,
+  "minimums": {"margin_usd": 10.0, "notional_usd": 10000.0},
+  "instruments": {
+    "BTC": {"id": 0, "price_scale": 10, "base_rate": 0.1, "rate_multiplier": 15000.0, "position_multiplier": 814.598, "reference_notional_usd": 100000.0, "bust_buffer": 0.000476041580087574, "max_leverage": 1000},
+    "ETH": {"id": 1, "price_scale": 100, "base_rate": 0.1, "rate_multiplier": 15000.0, "position_multiplier": 483.979, "reference_notional_usd": 100000.0, "bust_buffer": 0.00048130405018013, "max_leverage": 1000}
+  },
+  "bust_buffer_rel_tolerance": 0.05,
+  "frontend": {
+    "intent_id_tag": "papertrade:intent-id:v2",
+    "exchange_domain": "String",
+    "cancel_domain": "PaperTrade Intent Cancel"
+  }
+}

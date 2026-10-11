@@ -1,0 +1,32 @@
+# systemd unit for the farmer. Install:
+#   sudo cp deploy/papertrade-farmer*.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now papertrade-farmer.service papertrade-farmer-healthcheck.timer
+# Adjust User and WorkingDirectory. Configuration comes from WorkingDirectory/.env.
+
+[Unit]
+Description=Papertrade hedged PAPER farmer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=farmer
+WorkingDirectory=/opt/papertrade-farmer
+ExecStart=/opt/papertrade-farmer/.venv/bin/python -m ptfarmer run
+# SIGTERM starts a graceful shutdown: no new rounds, unhedged legs are
+# unwound, then exit. Give it longer than SHUTDOWN_GRACE_S (default 600).
+KillSignal=SIGTERM
+TimeoutStopSec=720
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/papertrade-farmer/data
+
+[Install]
+WantedBy=multi-user.target
