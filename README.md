@@ -102,9 +102,9 @@ by themselves; *halt* is latched until `ptfarmer resume`.
 | Cost per PAPER (includes expected mint-rate decay) | `MAX_COST_PER_PAPER=0.0016` | pause; `off` disables |
 | Daily loss: realized today + open worst case + next worst case | `DAILY_LOSS_CAP_USD=100` | pause; cannot be disabled |
 | Budget tranche available (see below) | none configured | pause |
-| LP floor: LP below $0.5M, or trending below it within `LP_TREND_HORIZON_H` | `LP_FLOOR_USD=500000` | pause |
+| LP floor: LP below the floor, or trending below it within `LP_TREND_HORIZON_H` (the opportunistic tranche uses `OPPORTUNISTIC_LP_MIN_USD` instead) | `LP_FLOOR_USD=500000` | pause |
 | Mint rate below 20 and no surplus flowing to stakers | `MINT_RATE_STOP=20` | pause |
-| Closes repeatedly slower than ~5 min | `CLOSE_LATENCY_ALERT_S=300`, `_COUNT=2` | alert, pause `CLOSE_LATENCY_PAUSE_S` |
+| Closes repeatedly slow (> `CLOSE_LATENCY_ALERT_S`) or overshooting (fills > `CLOSE_OVERSHOOT_ALERT_FRACTION` of the way from take-profit to liquidation) | 300 s, 0.5, `_COUNT=2` | `vol_matched`: lower leverage one step (up to `LEVERAGE_DERATE_MAX_STEPS`), then pause; `fixed`: alert and pause `CLOSE_LATENCY_PAUSE_S` |
 | Size: protocol minimums, max position, OI-cap headroom | always | pause |
 | Value side: fee yield, payback days, LP vs cap, LP trend | off | pause (advisory) |
 | Rule watch (below) | always | **halt** |
@@ -141,15 +141,76 @@ one's legs as orphans.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `LEVERAGE` | 40 | Hard cap 100. |
-| `TAKE_PROFIT_MOVE_PCT` | 1.0 | Sensible range 0.75–1. Must be ≤ `TP_MAX_FRACTION_OF_LIQ` (0.60) × the liquidation distance (2.45% at 40x). |
-| `EMERGENCY_BUST_DISTANCE_PCT` | 0.30 | Close early if the loser gets this close to bust. |
+| `CLOSE_MODE` | fixed | `fixed` uses `LEVERAGE` and `TAKE_PROFIT_MOVE_PCT`; `vol_matched` derives both from realised volatility (below). |
+| `MAX_LEVERAGE` | 100 | Hard cap for every mode. May be raised explicitly (e.g. 170), never above 200; the take-profit must still fit inside liquidation. |
+| `LEVERAGE` | 40 | `fixed` mode only; must be ≤ `MAX_LEVERAGE`. |
+| `TAKE_PROFIT_MOVE_PCT` | 1.0 | `fixed` mode only. Must be ≤ `TP_MAX_FRACTION_OF_LIQ` (0.60) × the liquidation distance (2.45% at 40x). |
+| `EMERGENCY_BUST_DISTANCE_PCT` | 0.30 | Close early if the loser gets this close to bust; per round, never more than half the take-profit-to-liquidation gap (so it cannot fire before the take-profit). |
 | `MARGIN_PER_LEG_USD` | 250 | With `SIZE_FROM_BALANCE=true`, capped at (available − `BALANCE_BUFFER_USD`) / 2. |
 | `ENABLE_ETH` | false | ETH is optional. |
 | `ROUND_COOLDOWN_S` | 60 | 0 = start the next round right after a close (gates permitting). |
 | `STAKE_MODE` | remind | `off`, `remind` (alerts when PAPER is unstaked), or `auto` (stakes after every round; see custody below). |
 
 The full list, with comments, is in [`.env.example`](.env.example).
+
+### Volatility-matched close (`CLOSE_MODE=vol_matched`)
+
+A hedged round costs roughly the same per unit of notional whatever the
+close distance, but takes about (d / σ_hourly)² hours to finish. At weekend
+volatility (~0.09%/h) a 1% close takes days, so a fixed close cannot spend a
+budget on a deadline. This mode matches the close to the market:
+
+```
+σ   = realised hourly vol of BTC over VOL_WINDOW_H (6h of completed 15m
+      Hyperliquid candles, POST api.hyperliquid.xyz/info candleSnapshot)
+d   = clamp(VOL_MULTIPLIER (2) × σ, CLOSE_MIN_PCT (0.30%), CLOSE_MAX_PCT (0.75%))
+L   = floor(min(1 / (d + VOL_LEVERAGE_BUFFER_PCT (0.30%)),
+                1 / (d / TP_MAX_FRACTION_OF_LIQ + bust buffer),
+                MAX_LEVERAGE, market max))
+```
+
+The second term is the unchanged "take-profit ≤ 60% of liquidation" rule.
+It binds above d ≈ 0.42%, so the leverage is lower than the
+1/(d + 0.30%) formula alone:
+
+| d | 1/(d+0.30%) | with the 60% rule | at `MAX_LEVERAGE=100` |
+| --- | --- | --- | --- |
+| 0.30% | 166x | 166x | 100x |
+| 0.40% | 142x | 140x | 100x |
+| 0.50% | 125x | 113x | 100x |
+| 0.75% | 95x | 77x | 77x |
+
+Other rules:
+
+* **No volatility reading.** If the candles are unavailable, the last
+  reading is used for up to 1h (`stale`). After that the round uses the
+  widest close, `CLOSE_MAX_PCT`, and an alert is sent.
+* **Pace.** `PACE_SCHEDULE=UTC=USD,...` (with `PACE_START`) lists spend
+  checkpoints. Once a checkpoint has passed and realized losses since
+  `PACE_START` are below it, d is set to `CLOSE_MIN_PCT`, within the
+  leverage cap.
+* **Close quality.** After `CLOSE_LATENCY_ALERT_COUNT` consecutive bad
+  closes (slow, overshooting, or with the loser liquidated), the buffer is
+  widened by `LEVERAGE_DERATE_STEP_PCT`. That lowers leverage, up to
+  `LEVERAGE_DERATE_MAX_STEPS` times. After that, new rounds pause. Five
+  clean closes restore one step.
+
+Each round records its mode, d, leverage, liquidation distance, σ, pace
+flag, exit move and overshoot. `ptfarmer check-config` prints the d →
+leverage table for the current settings. The monitor shows the next
+round's shape, the expected loss per round, the spend rate in $/h, and the
+spend projected for the next pace checkpoint.
+
+**What it can spend.** Expected spend per hour is margin × L × cost per
+notional ÷ (d/σ)². At σ = 0.09%/h, d = 0.30% and $1,400 per leg:
+
+| `MAX_LEVERAGE` | Expected loss per round | Round length | Spend in 41h |
+| --- | --- | --- | --- |
+| 100 | ~$74 | ~11h | ~$270 |
+| 170 | ~$123 | ~11h | ~$450 |
+
+The full $1,000 needs σ of about 0.15–0.25%/h, or a lower `CLOSE_MIN_PCT`.
+See the profile notes.
 
 ### Profiles
 
@@ -158,16 +219,31 @@ The full list, with comments, is in [`.env.example`](.env.example).
   above the 0.0016 limit, so **the default bot sits paused** and only the
   monitor and simulation do anything.
 * **[`profiles/max-paper.env`](profiles/max-paper.env)**: the owner's
-  maximum-staked-PAPER profile:
-  * BTC only, 40x, closed at a 1% move;
-  * $2,750 margin per leg, sized from balance;
-  * `MAX_COST_PER_PAPER=off`, a $1,000 daily cap, no cooldown;
-  * auto-stake, and the tranche schedule in
-    [`profiles/tranches.example.json`](profiles/tranches.example.json).
+  maximum-staked-PAPER profile for the "tonight" plan: a $4,000 wallet and
+  $1,000 of losses between Sun 11 Oct 20:00 AEDT (09:00Z) and Tue 13 Oct
+  13:00 AEDT (02:00Z).
+  * BTC only, `CLOSE_MODE=vol_matched`, `MAX_LEVERAGE=100`.
+  * $1,400 margin per leg, sized from balance with a $200 buffer. That is
+    full size while $3,000 or more is available.
+  * `MAX_COST_PER_PAPER=off`, a $1,000 daily cap, no cooldown, auto-stake.
+  * Pace checkpoints: $450 by Mon 12:00 AEDT and $800 by Tue 06:00 AEDT.
+  * Stop rules:
+    * The payout queue is open: stop.
+    * LP is below $1M: the standard tranche stops (`LP_FLOOR_USD`). The
+      exception is the flat-100 band ($0.5M–$2M, queue empty), where the
+      `flat_band` remainder tranche farms what is left in $400/leg rounds.
+      Below $0.5M everything stops.
+    * The mint rate is below 28: stop and keep the remaining budget
+      (`MIN_MINT_RATE`, `MINT_RATE_STOP`).
+    * Closes take more than 3 minutes or overshoot: derate, then pause.
+  * The tranches are in
+    [`profiles/tranches.example.json`](profiles/tranches.example.json):
+    `tonight` ($1,000, windowed) and `flat_band` (the remainder, same
+    deadline).
 
-  It still starts in DRY_RUN. It uses `ROUND_COST_SAFETY_FACTOR=1.25`, so
-  a full-size round fits a fresh $500 tranche; the file explains the
-  trade-off.
+  It still starts in DRY_RUN. `ROUND_COST_SAFETY_FACTOR=1.25` reserves
+  about $312 per open full-size round. The dates are specific to this plan,
+  so edit them for the next one.
 
 ### Budget tranches
 
@@ -185,7 +261,13 @@ Each round draws from the first *standard* tranche that:
 * is inside its window;
 * has a mint rate ≥ its `min_mint_rate` (default `MIN_MINT_RATE=28`);
 * is open while the payout queue is empty;
+* has tracked LP at or above `LP_FLOOR_USD`;
 * can still absorb a minimum-size round.
+
+An opportunistic tranche may use `"budget_usd": "remainder"`. When one is
+configured, every tranche draws on a single pool: the sum of the standard
+budgets. The remainder tranche can then spend only what the plan has not
+spent yet, and total losses never exceed the plan.
 
 A tranche is spent by its rounds' realized net losses plus the worst case of
 its open rounds.
@@ -221,7 +303,11 @@ The **monitor** and the **daily summary** (posted automatically after
 * staker yield per PAPER per day and its trend, and payback days;
 * PAPER minted and staked, staked balance, and claimable rewards;
 * daily budget and tranche budget used and remaining;
-* close latency and the alert counts.
+* the next round's close shape: mode, σ and its source, d, leverage,
+  liquidation, take-profit as a % of liquidation, and the emergency
+  distance;
+* expected loss per round, spend rate, pace and projected spend;
+* leverage derate state, close latency, and the alert counts.
 
 `WEBHOOK_URL` takes a Slack- or Discord-compatible incoming webhook.
 
@@ -271,6 +357,9 @@ Sources:
   * a ratchet mint rate of 100·(120M/(120M+tail))².
 * Our signatures recover to the signer, and our wire format reproduces the
   frontend's (strings, `v` as "27"/"28").
+* Hyperliquid `candleSnapshot` (public, no key): the response shape
+  (`t`, `T`, `o`, `c`, `h`, `l`, `v`, `n`), read live by the monitor
+  (σ = 0.070%/h over 6h at 00:35Z on 11 Oct).
 
 **Decoded from the bundle but never exercised (no live submission was made):**
 
@@ -319,5 +408,19 @@ Sources:
   `WALLET_ADDRESS`, and it is refused unless the stake mode is `auto`.
 * **Single instance per wallet.** The data-dir lock prevents two farmers on
   one host. It cannot stop two hosts using the same wallet.
-* **Model inputs.** Decay and cycle time use configured volatility until
-  enough samples exist. OI caps are keeper-dynamic.
+* **Model inputs.** In `fixed` mode, decay and cycle time use the
+  configured volatility. In `vol_matched` mode they use the measured σ
+  (√24 × hourly). Both assume a driftless random walk:
+  round length ≈ (d/σ)² + fill latency. OI caps are keeper-dynamic.
+* **The budget may not be spendable in time.** At σ of 0.07–0.09%/h, even
+  d = 0.30% rounds take 11–18h. Projected spend by the 13 Oct deadline is
+  about $270 (100x) or $450 (170x), not $1,000.
+* **The mint-rate stop may come first.** At the measured tail growth
+  (~$2.1M/h, 11 Oct 00:35Z), the rate falls from ~40 to 28 in about 17h,
+  around Mon 12 Oct 04:50 AEDT. That leaves roughly 9h of farming after
+  the 20:00 AEDT start, unless LP drops into the flat-100 band.
+* **Tighter closes are more sensitive to the relayer.** The margin between
+  take-profit and liquidation is 0.25–0.65%. A close that lands late can
+  overshoot or liquidate the loser. Overshoot is measured on every round and
+  feeds the derate/pause logic. A liquidated loser remains an accepted
+  outcome; the winner is always closed.

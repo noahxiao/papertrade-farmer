@@ -115,8 +115,14 @@ def test_shipped_env_files_are_valid_and_dry_run(path, monkeypatch):
 def test_max_paper_profile_matches_scenario(monkeypatch):
     monkeypatch.chdir(ROOT)
     c = load_config(env=load_dotenv(ROOT / "profiles" / "max-paper.env"))
-    assert (c.leverage, c.take_profit_move, c.markets) == (40, 0.01, ("BTC",))
-    assert c.size_from_balance and 2500 <= c.margin_per_leg_usd <= 3000
+    assert (c.close_mode, c.max_leverage, c.markets) == ("vol_matched", 100, ("BTC",))
+    assert (c.close_min, c.close_max, c.vol_window_h, c.vol_multiplier) == (0.003, 0.0075, 6.0, 2.0)
+    assert c.size_from_balance and c.margin_per_leg_usd == 1400 and c.balance_buffer_usd == 200
+    assert (4000 - c.balance_buffer_usd) / 2 >= c.margin_per_leg_usd, "full size on a $4k wallet"
     assert c.max_cost_per_paper is None and c.daily_loss_cap_usd == 1000
     assert c.round_cooldown_s == 0 and c.stake_mode == "auto"
-    assert [t.name for t in c.tranches] and any(t.kind == "opportunistic" for t in c.tranches)
+    assert (c.lp_floor_usd, c.opportunistic_lp_min_usd, c.min_mint_rate) == (1_000_000, 500_000, 28)
+    assert c.close_latency_alert_s == 180
+    assert [cp.spent_usd for cp in c.pace_schedule] == [450, 800]
+    assert sum(t.budget_usd for t in c.tranches if t.kind == "standard") == 1000
+    assert any(t.remainder for t in c.tranches)
