@@ -1,0 +1,5 @@
+[
+  {"name": "tranche1", "budget_usd": 500},
+  {"name": "tranche2", "budget_usd": 500, "available_until": "2026-10-17T18:45:00Z"},
+  {"name": "reserve", "budget_usd": 300, "kind": "opportunistic"}
+]

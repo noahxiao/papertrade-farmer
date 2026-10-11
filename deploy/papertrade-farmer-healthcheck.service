@@ -1,0 +1,10 @@
+# Restarts the farmer when its heartbeat goes stale (hung loop, not a crash:
+# crashes are already handled by Restart=always).
+[Unit]
+Description=Papertrade farmer heartbeat check
+
+[Service]
+Type=oneshot
+User=farmer
+WorkingDirectory=/opt/papertrade-farmer
+ExecStart=/bin/sh -c '/opt/papertrade-farmer/.venv/bin/python -m ptfarmer healthcheck || systemctl restart papertrade-farmer.service'
